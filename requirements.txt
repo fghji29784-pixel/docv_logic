@@ -1,0 +1,17 @@
+# dOCV 선별 로직 고도화 분석기 의존성
+# 설치: pip install -r requirements.txt
+
+# ── 필수 (핵심 기능) ─────────────────────────────────────────
+pandas>=1.5.0
+numpy>=1.22.0
+matplotlib>=3.5.0
+openpyxl>=3.0.0          # Excel 읽기/쓰기
+
+# ── 선택 (Method-E ML 고도화 및 Method-A Huber 회귀) ─────────
+# sklearn 없으면 numpy 대체 구현으로 자동 폴백됨
+scikit-learn>=1.0.0      # Isolation Forest + LOF + HuberRegressor
+
+# ── 환경별 설치 참고 ─────────────────────────────────────────
+# Python 3.9+ (64bit) 권장: 위 패키지 모두 pip install 가능
+# Python 3.8 32bit      : scikit-learn 설치 불가 → 필수 4개만 설치
+#   pip install pandas numpy matplotlib openpyxl
