@@ -135,16 +135,36 @@ def run(path):
             mask &= ~np.isnan(a)
         return [a[mask] for a in arrs], mask
 
+    # 로버스트 축범위: 이상치에 안 늘어나게 백분위 기반
+    def rlim(arr, lo=0.5, hi=99.5, pad=0.1, sym=False):
+        a = np.asarray(arr, dtype=float)
+        a = a[~np.isnan(a)]
+        if len(a) == 0:
+            return None
+        p_lo, p_hi = np.percentile(a, [lo, hi])
+        if sym:                      # 0 중심 대칭
+            r = max(abs(p_lo), abs(p_hi))
+            r = r * (1 + pad) if r > 0 else 1.0
+            return (-r, r)
+        span = p_hi - p_lo
+        span = span if span > 0 else 1.0
+        return (p_lo - span * pad, p_hi + span * pad)
+
     # (1) T1-T3, T1-T2, T2-T3 분포  ★dU/dT 핵심
     ax = fig.add_subplot(gs[0, 0])
     for arr, lbl, c in [(dT_13, "T1−T3", "crimson"),
                         (dT_12, "T1−T2", "steelblue"),
                         (dT_23, "T2−T3", "seagreen")]:
         a = arr[~np.isnan(arr)]
-        ax.hist(a, bins=80, alpha=0.5, label=lbl, color=c)
+        ax.hist(a, bins=120, alpha=0.5, label=lbl, color=c)
     ax.axvline(0, color="black", lw=1, ls="--")
-    ax.set_title("① 시점 간 온도차 분포  ★dU/dT 판정", fontweight="bold")
-    ax.set_xlabel("온도차 (°C)"); ax.set_ylabel("셀 수")
+    xl = rlim(np.concatenate([dT_13[~np.isnan(dT_13)],
+                              dT_12[~np.isnan(dT_12)],
+                              dT_23[~np.isnan(dT_23)]]), sym=True)
+    if xl: ax.set_xlim(xl)
+    ax.set_title("① 시점 간 온도차 분포  ★dU/dT 판정  (축 줌인)",
+                 fontweight="bold")
+    ax.set_xlabel("온도차 (°C)  ※꼬리 이상치는 축 밖"); ax.set_ylabel("셀 수")
     ax.legend(fontsize=9)
 
     # (2) 온도 vs ΔOCV, 위치(Col)로 색칠
@@ -156,6 +176,9 @@ def run(path):
     else:
         (Tc, dc), _ = clean(T_avg, dOCV)
         ax.scatter(Tc, dc, s=6, alpha=0.4, color="steelblue")
+    xl = rlim(T_avg); yl = rlim(dOCV)
+    if xl: ax.set_xlim(xl)
+    if yl: ax.set_ylim(yl)
     ax.set_title("② 온도 vs ΔOCV (색=위치)")
     ax.set_xlabel("T_avg (°C)"); ax.set_ylabel("ΔOCV (mV)")
 
@@ -204,9 +227,12 @@ def run(path):
     for arr, lbl, c in [(T1, "T1", "#e74c3c"), (T2, "T2", "#f39c12"),
                         (T3, "T3", "#3498db")]:
         a = arr[~np.isnan(arr)]
-        ax.hist(a, bins=80, alpha=0.45, label=lbl, color=c)
-    ax.set_title("④ 시점별 온도 분포 (시간 드리프트 확인)")
-    ax.set_xlabel("온도 (°C)"); ax.set_ylabel("셀 수")
+        ax.hist(a, bins=120, alpha=0.45, label=lbl, color=c)
+    xl = rlim(np.concatenate([T1[~np.isnan(T1)], T2[~np.isnan(T2)],
+                              T3[~np.isnan(T3)]]))
+    if xl: ax.set_xlim(xl)
+    ax.set_title("④ 시점별 온도 분포 (시간 드리프트 확인)  (축 줌인)")
+    ax.set_xlabel("온도 (°C)  ※꼬리 이상치는 축 밖"); ax.set_ylabel("셀 수")
     ax.legend(fontsize=9)
 
     # (5) ΔOCV vs (T1-T3)  + 회귀기울기(=경험적 dU/dT)
@@ -214,51 +240,71 @@ def run(path):
     (xx, yy), _ = clean(dT_13, dOCV)
     ax.scatter(xx, yy, s=6, alpha=0.4, color="purple")
     slope = np.nan
+    # 기울기는 이상치 제외(중앙 99%)로 적합 → 본체 추세 반영
     if len(xx) > 10 and np.std(xx) > 1e-6:
-        slope, intc = np.polyfit(xx, yy, 1)
-        xs = np.linspace(xx.min(), xx.max(), 50)
-        ax.plot(xs, slope * xs + intc, "orange", lw=2,
-                label=f"기울기 {slope:.3f} mV/°C")
-        ax.legend(fontsize=9)
+        plo, phi = np.percentile(xx, [0.5, 99.5])
+        inner = (xx >= plo) & (xx <= phi)
+        if inner.sum() > 10:
+            slope, intc = np.polyfit(xx[inner], yy[inner], 1)
+            xs = np.linspace(plo, phi, 50)
+            ax.plot(xs, slope * xs + intc, "orange", lw=2,
+                    label=f"기울기 {slope:.3f} mV/°C")
+            ax.legend(fontsize=9)
+    xl = rlim(dT_13, sym=True); yl = rlim(dOCV)
+    if xl: ax.set_xlim(xl)
+    if yl: ax.set_ylim(yl)
     ax.axvline(0, color="black", lw=0.8, ls="--")
-    ax.set_title("⑤ ΔOCV vs (T1−T3)  (가짜신호 직접확인)")
+    ax.set_title("⑤ ΔOCV vs (T1−T3)  (가짜신호 직접확인)  (축 줌인)")
     ax.set_xlabel("T1−T3 (°C)"); ax.set_ylabel("ΔOCV (mV)")
 
     # (6) 자동 해석 텍스트
     ax = fig.add_subplot(gs[1, 2]); ax.axis("off")
-    std13 = np.nanstd(dT_13)
+    d13 = dT_13[~np.isnan(dT_13)]
+    std13 = np.nanstd(dT_13)                              # 비로버스트(이상치 영향)
+    iqr13 = np.subtract(*np.percentile(d13, [75, 25])) if len(d13) else np.nan
+    rstd13 = iqr13 / 1.349 if not np.isnan(iqr13) else np.nan   # 로버스트 std
     pct_big = np.nanmean(np.abs(dT_13) > 1.0) * 100
+    # 불량핀 추정: T_avg가 정상대(중앙±robust) 밖
+    Tv = T_avg[~np.isnan(T_avg)]
+    tmed = np.median(Tv); tiqr = np.subtract(*np.percentile(Tv, [75, 25]))
+    bad_lo = tmed - 4 * (tiqr / 1.349)
+    pct_badpin = np.nanmean(T_avg < bad_lo) * 100
     rng = np.nanmax(T_avg) - np.nanmin(T_avg)
 
     lines = ["[ 자동 해석 ]", ""]
-    lines.append(f"• T1−T3 표준편차 : {std13:.3f} °C")
-    lines.append(f"• |T1−T3|>1°C 셀 : {pct_big:.1f} %")
-    lines.append(f"• T_avg 전체 범위 : {rng:.2f} °C")
+    lines.append(f"• T1−T3 std(로버스트): {rstd13:.3f} °C")
+    lines.append(f"• T1−T3 std(전체)   : {std13:.3f} °C")
+    lines.append(f"• |T1−T3|>1°C 셀    : {pct_big:.1f} %")
+    lines.append(f"• 불량핀 추정(<{bad_lo:.1f}°C): {pct_badpin:.2f} %")
+    lines.append(f"• T_avg 전체 범위   : {rng:.2f} °C")
     if not np.isnan(slope):
         lines.append(f"• ΔOCV~(T1−T3) 기울기: {slope:.3f} mV/°C")
     if not np.isnan(smooth):
-        lines.append(f"• 트레이 공간 매끄러움: {smooth:.2f}")
-        lines.append("   (<0.5 매끄러움=구배 / >0.9 무작위=핀노이즈)")
+        lines.append(f"• 공간 매끄러움     : {smooth:.2f}")
     lines.append("")
     lines.append("[ 판정 ]")
-    # dU/dT 판정
-    if std13 < 0.2:
-        lines.append("▶ T1−T3 매우 좁음 →")
-        lines.append("  dU/dT 보정 불필요 (스킵)")
-    elif std13 < 0.5:
-        lines.append("▶ T1−T3 작음 → dU/dT 효과 제한적")
+    # dU/dT 판정 — 직접증거(기울기) 우선 + 로버스트 산포
+    slope_small = (not np.isnan(slope)) and abs(slope) < 0.05
+    if slope_small and (np.isnan(rstd13) or rstd13 < 0.3):
+        lines.append("▶ 기울기≈0 & T1−T3 좁음 →")
+        lines.append("  dU/dT 보정 불필요 (스킵 확정)")
+    elif (not np.isnan(rstd13)) and rstd13 >= 0.5 and not slope_small:
+        lines.append("▶ T1−T3 넓고 기울기 유의 →")
+        lines.append("  dU/dT 보정 유효")
     else:
-        lines.append("▶ T1−T3 큼 → dU/dT 보정 유효")
-    # 공간 판정
+        lines.append("▶ dU/dT 효과 제한적")
+    # 핀 판정
+    if pct_badpin > 0.3:
+        lines.append(f"▶ 불량핀 {pct_badpin:.1f}% 존재 →")
+        lines.append("  핀 제외/이웃보간 후 온도활용")
     if not np.isnan(smooth):
         if smooth < 0.5:
-            lines.append("▶ 온도 공간 매끄러움 →")
-            lines.append("  B_NNR/GP 공간보정 유효, 핀 신뢰")
+            lines.append("▶ 본체 온도 매끄러움 →")
+            lines.append("  B_NNR/GP 공간보정 유효")
         elif smooth > 0.9:
-            lines.append("▶ 온도 무작위 → 온도핀 불신,")
-            lines.append("  공간보정 제한적")
+            lines.append("▶ 온도 무작위 → 핀 불신")
         else:
-            lines.append("▶ 온도 약한 구배 존재")
+            lines.append("▶ 약한 구배 + 불량핀 혼재")
 
     ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
             fontsize=11, va="top", family="monospace",
@@ -272,8 +318,10 @@ def run(path):
 
     # 콘솔에도 요약
     print("\n── 요약 ──")
-    print(f"  T1−T3 std = {std13:.3f}°C, |T1−T3|>1°C = {pct_big:.1f}%, "
-          f"T_avg 범위 = {rng:.2f}°C")
+    print(f"  T1−T3 std(로버스트)={rstd13:.3f}°C, std(전체)={std13:.3f}°C, "
+          f"|T1−T3|>1°C={pct_big:.1f}%")
+    print(f"  불량핀 추정(<{bad_lo:.1f}°C)={pct_badpin:.2f}%, "
+          f"T_avg 범위={rng:.2f}°C")
     if not np.isnan(slope):
         print(f"  ΔOCV~(T1−T3) 기울기 = {slope:.3f} mV/°C")
     if not np.isnan(smooth):
