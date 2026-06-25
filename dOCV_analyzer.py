@@ -229,8 +229,13 @@ def method_dpat(feat: pd.DataFrame,
 
 def method_temp_regression(feat: pd.DataFrame,
                            k: float = K_SIGMA,
-                           floor: float = FLOOR_MV) -> tuple:
-    """ΔOCV ~ T 로버스트 회귀 → 잔차 DPAT. (flags, residuals, expected)"""
+                           floor: float = FLOOR_MV,
+                           mode: str = "arrhenius") -> tuple:
+    """
+    ΔOCV ~ T 로버스트 회귀 → 잔차 DPAT. (flags, residuals, expected)
+    mode="arrhenius": ln(ΔOCV) ~ 1/T_K 지수 회귀 (고온부 급상승 대응, 기본)
+    mode="linear":    ΔOCV ~ T 선형 회귀
+    """
     if "T_avg" not in feat.columns:
         flags = method_dpat(feat, k, floor)
         return flags, feat["dOCV_raw"].copy(), pd.Series(0.0, index=feat.index)
@@ -238,20 +243,25 @@ def method_temp_regression(feat: pd.DataFrame,
     d = feat["dOCV_raw"].values
     T = feat["T_avg"].values
 
-    # NaN이 있는 행 제외하고 적합, 예측은 NaN 위치에 트레이 평균 온도로 대체
+    # NaN이 있는 행 제외하고 적합, 예측은 NaN 위치에 평균 온도로 대체
     valid = ~(np.isnan(T) | np.isnan(d))
     if valid.sum() < 4:
         flags = method_dpat(feat, k, floor)
         return flags, feat["dOCV_raw"].copy(), pd.Series(0.0, index=feat.index)
 
-    T_fill = np.where(np.isnan(T), np.nanmean(T), T)   # NaN → 평균 온도
+    T_fill = np.where(np.isnan(T), np.nanmean(T), T)
 
-    if SKLEARN_OK:
-        reg = HuberRegressor(epsilon=1.5, max_iter=300)
-        reg.fit(T_fill[valid].reshape(-1, 1), d[valid])
-        d_exp = reg.predict(T_fill.reshape(-1, 1))
-    else:
-        d_exp = _robust_linreg_numpy(T_fill, d, valid_mask=valid)
+    d_exp = None
+    if mode == "arrhenius":
+        d_exp = _arrhenius_regression(T_fill, d, valid)   # 실패 시 None
+
+    if d_exp is None:   # 선형 폴백
+        if SKLEARN_OK:
+            reg = HuberRegressor(epsilon=1.5, max_iter=300)
+            reg.fit(T_fill[valid].reshape(-1, 1), d[valid])
+            d_exp = reg.predict(T_fill.reshape(-1, 1))
+        else:
+            d_exp = _robust_linreg_numpy(T_fill, d, valid_mask=valid)
 
     resid    = pd.Series(d - d_exp, index=feat.index)
     expected = pd.Series(d_exp,     index=feat.index)
@@ -259,6 +269,29 @@ def method_temp_regression(feat: pd.DataFrame,
     mad = _mad_normal(resid)
     flags = resid > max(med + k * mad, med + floor)
     return flags, resid, expected
+
+
+def _arrhenius_regression(T_cel, d, valid_mask, min_pts=10):
+    """
+    아렌니우스 지수 회귀: ln(ΔOCV) = a + b·(1/T_K)
+    자가방전 전류 I∝exp(-Ea/kT) 형태를 직접 반영해 고온부 급상승을 따라감.
+    양수 ΔOCV가 부족하면 None 반환(→ 선형 폴백).
+    """
+    T_K = T_cel + 273.15
+    x   = 1.0 / T_K
+    pos = valid_mask & (d > 0)
+    if pos.sum() < min_pts:
+        return None
+
+    lny = np.full(len(d), np.nan)
+    lny[pos] = np.log(d[pos])
+
+    # 로그공간 로버스트 선형 적합 → 전체 셀에 대해 예측 후 지수 환원
+    pred_lny = _robust_linreg_numpy(x, lny, valid_mask=pos)
+    d_exp = np.exp(pred_lny)
+    # 수치 안정: 음수/발산 방지
+    d_exp = np.clip(d_exp, 1e-6, np.nanmax(d[valid_mask]) * 5)
+    return d_exp
 
 
 def _robust_linreg_numpy(T, y, n_iter=10, valid_mask=None):
@@ -533,49 +566,66 @@ def plot_dashboard(feat: pd.DataFrame, res: pd.DataFrame,
     K     = feat["K_slope"]
     n_mth = len(res.columns)
 
-    # (0,0) ΔOCV 분포 & 임계값
+    # ── 분석 대상 마스크: 온도 필터 제외 셀(-1)을 모든 패널에서 배제 ──
+    analyzed = (res[res.columns[0]] >= 0)   # -1 = 제외, 0/1 = 분석됨
+    n_excl   = int((~analyzed).sum())
+    d_a = d[analyzed]
+    K_a = K[analyzed]
+
+    # (0,0) ΔOCV 분포 & 임계값  (분석 대상만)
     ax = fig.add_subplot(gs[0, 0])
-    ax.hist(d, bins=60, color="steelblue", alpha=0.75, edgecolor="white")
-    med_d  = float(np.median(d))
-    mad_d  = _mad_normal(d)
-    mode_d = float((d * 1000).round().mode().iloc[0] / 1000)
+    ax.hist(d_a, bins=60, color="steelblue", alpha=0.75, edgecolor="white")
+    med_d  = float(np.median(d_a))
+    mad_d  = _mad_normal(d_a)
+    mode_d = float((d_a * 1000).round().mode().iloc[0] / 1000)
     ax.axvline(med_d, color="orange", lw=2, label=f"Median {med_d:.3f}")
     ax.axvline(mode_d, color="red", lw=2, ls="--", label=f"Mode {mode_d:.3f}")
     ax.axvline(med_d + K_SIGMA * mad_d, color="green", lw=1.5, ls=":",
                label=f"DPAT({K_SIGMA}σ)")
     ax.axvline(mode_d + FIXED_OFFSET, color="purple", lw=1.5, ls="-.",
                label=f"Baseline(+{FIXED_OFFSET}mV)")
-    ax.set_title("ΔOCV 분포 & 임계값 비교")
+    title00 = "ΔOCV 분포 & 임계값 비교"
+    if n_excl > 0:
+        title00 += f"  (제외 {n_excl}셀)"
+    ax.set_title(title00)
     ax.set_xlabel("ΔOCV (mV)")
     ax.legend(fontsize=7)
 
-    # (0,1) 온도 vs ΔOCV
+    # (0,1) 온도 vs ΔOCV  (필터 제외 셀은 표시하지 않음)
     ax = fig.add_subplot(gs[0, 1])
     if "T_avg" in feat.columns:
-        T         = feat["T_avg"]
-        base_flag = res["Baseline"].astype(bool)
-        ax.scatter(T[~base_flag], d[~base_flag],
+        T = feat["T_avg"]
+        # 분석 대상 안에서 Baseline 양품/불량 구분
+        base_def = analyzed & (res["Baseline"] == 1)
+        base_ok  = analyzed & (res["Baseline"] == 0)
+        ax.scatter(T[base_ok], d[base_ok],
                    c="steelblue", s=8, alpha=0.4, label="양품")
-        ax.scatter(T[base_flag], d[base_flag],
+        ax.scatter(T[base_def], d[base_def],
                    c="red", s=20, alpha=0.8, label="불량(Baseline)")
         if "A_expected" in extra:
-            order = T.argsort()
-            ax.plot(T.values[order], extra["A_expected"].values[order],
-                    "orange", lw=2, label="로버스트 회귀")
+            # 회귀선도 분석 대상 구간만
+            Ta = T[analyzed]
+            Ea = extra["A_expected"][analyzed]
+            order = np.argsort(Ta.values)
+            ax.plot(Ta.values[order], Ea.values[order],
+                    "orange", lw=2, label="아렌니우스 회귀")
         ax.set_xlabel("T_avg (°C)")
         ax.set_ylabel("ΔOCV (mV)")
-        ax.set_title("온도 vs ΔOCV & 회귀선")
+        ttl = "온도 vs ΔOCV & 회귀선"
+        if n_excl > 0:
+            ttl += "  (필터 통과 셀만)"
+        ax.set_title(ttl)
         ax.legend(fontsize=7)
     else:
         ax.text(0.5, 0.5, "온도 데이터 없음",
                 transform=ax.transAxes, ha="center", va="center")
         ax.set_title("온도 vs ΔOCV")
 
-    # (0,2) K값 분포
+    # (0,2) K값 분포  (분석 대상만)
     ax = fig.add_subplot(gs[0, 2])
-    ax.hist(K, bins=60, color="mediumpurple", alpha=0.75, edgecolor="white")
-    med_K = float(np.median(K))
-    thr_K = med_K + K_SIGMA * _mad_normal(K)
+    ax.hist(K_a, bins=60, color="mediumpurple", alpha=0.75, edgecolor="white")
+    med_K = float(np.median(K_a))
+    thr_K = med_K + K_SIGMA * _mad_normal(K_a)
     ax.axvline(med_K, color="orange", lw=2, label=f"Median {med_K:.4f}")
     ax.axvline(thr_K, color="red", lw=2, ls="--",
                label=f"임계값({K_SIGMA}σ) {thr_K:.4f}")
@@ -583,28 +633,31 @@ def plot_dashboard(feat: pd.DataFrame, res: pd.DataFrame,
     ax.set_xlabel("K (mV/day)")
     ax.legend(fontsize=7)
 
-    # (1,0~1) 방법별 불량 수
+    # (1,0~1) 방법별 불량 수  (== 1 만 집계, -1/0 제외)
     ax = fig.add_subplot(gs[1, :2])
     names  = list(res.columns)
-    counts = [int(res[c].sum()) for c in names]
+    counts = [int((res[c] == 1).sum()) for c in names]
     palette = ["#e74c3c","#3498db","#2ecc71","#9b59b6",
                "#f39c12","#1abc9c","#e67e22","#34495e","#16a085"]
     bars = ax.bar(names, counts, color=palette[:len(names)], edgecolor="white")
+    ymax = max(counts) if max(counts) > 0 else 1
     for bar, cnt in zip(bars, counts):
         ax.text(bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.3,
+                bar.get_height() + ymax * 0.01,
                 str(cnt), ha="center", va="bottom", fontsize=9)
-    ax.set_title("방법별 불량 판정 셀 수")
+    ax.set_title("방법별 불량 판정 셀 수 (분석 대상 기준)")
     ax.set_ylabel("불량 판정 수")
     ax.tick_params(axis="x", rotation=35)
 
-    # (1,2) Jaccard 히트맵
+    # (1,2) Jaccard 히트맵  (불량==1 집합 기준)
     ax = fig.add_subplot(gs[1, 2])
     J = np.zeros((n_mth, n_mth))
     for i, mi in enumerate(names):
         for j, mj in enumerate(names):
-            inter = (res[mi].astype(bool) & res[mj].astype(bool)).sum()
-            union = (res[mi].astype(bool) | res[mj].astype(bool)).sum()
+            si = (res[mi] == 1)
+            sj = (res[mj] == 1)
+            inter = (si & sj).sum()
+            union = (si | sj).sum()
             J[i, j] = inter / (union + 1e-9)
     im = ax.imshow(J, cmap="RdYlGn", vmin=0, vmax=1)
     short = [n[:8] for n in names]
@@ -613,30 +666,37 @@ def plot_dashboard(feat: pd.DataFrame, res: pd.DataFrame,
     ax.set_title("방법 간 Jaccard 동의율")
     plt.colorbar(im, ax=ax, shrink=0.8)
 
-    # (2, :) 트레이 맵 or 산점도
+    # (2, :) 트레이 맵 or 산점도  (== 1 만 투표, 제외 셀은 회색)
     ax = fig.add_subplot(gs[2, :])
-    vote = res.sum(axis=1)
+    vote = (res == 1).sum(axis=1)   # 각 셀을 불량 판정한 방법 수
 
     if "row" in m and "col" in m:
         rows_v = feat[m["row"]].astype(int).values
         cols_v = feat[m["col"]].astype(int).values
         nr = rows_v.max() - rows_v.min() + 1
         nc = cols_v.max() - cols_v.min() + 1
-        vmap = np.zeros((nr, nc))
+        vmap = np.full((nr, nc), np.nan)   # NaN = 제외 셀(회색)
         r0, c0 = rows_v.min(), cols_v.min()
+        analyzed_v = analyzed.values
         for i in range(len(feat)):
-            vmap[rows_v[i] - r0, cols_v[i] - c0] = vote.iloc[i] / n_mth
-        im2 = ax.imshow(vmap, cmap="Reds", vmin=0, vmax=1, aspect="auto")
-        # X축 레이블: A~L
+            if analyzed_v[i]:
+                vmap[rows_v[i] - r0, cols_v[i] - c0] = vote.iloc[i] / n_mth
+        cmap = plt.cm.Reds.copy()
+        cmap.set_bad("lightgray")          # 제외 셀 회색
+        im2 = ax.imshow(vmap, cmap=cmap, vmin=0, vmax=1, aspect="auto")
         ax.set_xticks(range(nc))
         ax.set_xticklabels([chr(65 + c0 - 1 + i) for i in range(nc)], fontsize=9)
         ax.set_yticks(range(nr))
         ax.set_yticklabels(range(r0, r0 + nr), fontsize=9)
-        ax.set_title("트레이 앙상블 불량 맵 (진할수록 다수 방법 불량 판정)")
+        ttl = "트레이 앙상블 불량 맵 (진할수록 다수 방법 불량 판정)"
+        if n_excl > 0:
+            ttl += " / 회색=필터 제외"
+        ax.set_title(ttl)
         ax.set_xlabel("열 (A~L)"); ax.set_ylabel("행 (1~12)")
         plt.colorbar(im2, ax=ax, label="불량 판정 비율")
     else:
-        sc = ax.scatter(d, K, c=vote, cmap="RdYlGn_r", s=12, alpha=0.7)
+        sc = ax.scatter(d_a, K_a, c=vote[analyzed], cmap="RdYlGn_r",
+                        s=12, alpha=0.7)
         ax.set_xlabel("ΔOCV (mV)"); ax.set_ylabel("K 기울기 (mV/day)")
         ax.set_title("ΔOCV vs K값 (색상 = 불량 판정 방법 수)")
         plt.colorbar(sc, ax=ax, label="불량 판정 방법 수")
