@@ -21,10 +21,13 @@ warnings.filterwarnings("ignore")
 
 
 def _mad_normal(x):
-    """MAD (정규분포 환산 ×1.4826), scipy 불필요"""
+    """MAD (정규분포 환산 ×1.4826), NaN 무시"""
     x = np.asarray(x, dtype=float)
-    med = np.median(x)
-    return np.median(np.abs(x - med)) * 1.4826
+    x = x[~np.isnan(x)]
+    if len(x) == 0:
+        return 0.0
+    med = np.nanmedian(x)
+    return np.nanmedian(np.abs(x - med)) * 1.4826
 
 
 # ── 옵션 의존성 ──────────────────────────────────────────────
@@ -219,7 +222,7 @@ def method_dpat(feat: pd.DataFrame,
                 col: str = "dOCV_raw") -> pd.Series:
     """median + k·MAD (DPAT)"""
     d = feat[col]
-    med = float(np.median(d))
+    med = float(np.nanmedian(d))
     mad = _mad_normal(d)
     return d > max(med + k * mad, med + floor)
 
@@ -235,12 +238,20 @@ def method_temp_regression(feat: pd.DataFrame,
     d = feat["dOCV_raw"].values
     T = feat["T_avg"].values
 
+    # NaN이 있는 행 제외하고 적합, 예측은 NaN 위치에 트레이 평균 온도로 대체
+    valid = ~(np.isnan(T) | np.isnan(d))
+    if valid.sum() < 4:
+        flags = method_dpat(feat, k, floor)
+        return flags, feat["dOCV_raw"].copy(), pd.Series(0.0, index=feat.index)
+
+    T_fill = np.where(np.isnan(T), np.nanmean(T), T)   # NaN → 평균 온도
+
     if SKLEARN_OK:
         reg = HuberRegressor(epsilon=1.5, max_iter=300)
-        reg.fit(T.reshape(-1, 1), d)
-        d_exp = reg.predict(T.reshape(-1, 1))
+        reg.fit(T_fill[valid].reshape(-1, 1), d[valid])
+        d_exp = reg.predict(T_fill.reshape(-1, 1))
     else:
-        d_exp = _robust_linreg_numpy(T, d)
+        d_exp = _robust_linreg_numpy(T_fill, d, valid_mask=valid)
 
     resid    = pd.Series(d - d_exp, index=feat.index)
     expected = pd.Series(d_exp,     index=feat.index)
@@ -250,8 +261,13 @@ def method_temp_regression(feat: pd.DataFrame,
     return flags, resid, expected
 
 
-def _robust_linreg_numpy(T, y, n_iter=10):
-    mask = np.ones(len(T), dtype=bool)
+def _robust_linreg_numpy(T, y, n_iter=10, valid_mask=None):
+    """반복적 이상치 제거 선형 회귀 (numpy 전용). valid_mask로 NaN 행 제외."""
+    if valid_mask is None:
+        valid_mask = ~(np.isnan(T) | np.isnan(y))
+    mask = valid_mask.copy()
+    if mask.sum() < 4:
+        return np.full(len(T), np.nanmean(y))
     coeff = np.polyfit(T[mask], y[mask], 1)
     for _ in range(n_iter):
         y_fit = np.polyval(coeff, T)
@@ -259,7 +275,7 @@ def _robust_linreg_numpy(T, y, n_iter=10):
         mad = _mad_normal(resid[mask])
         if mad < 1e-12:
             break
-        mask = resid <= 2.5 * mad
+        mask = valid_mask & (resid <= 2.5 * mad)
         if mask.sum() < 4:
             break
         coeff = np.polyfit(T[mask], y[mask], 1)
@@ -393,10 +409,28 @@ def _run_one_tray(feat_t: pd.DataFrame, m: dict,
 def run_all(feat: pd.DataFrame, m: dict,
             k: float = K_SIGMA,
             floor: float = FLOOR_MV,
-            labels: pd.Series = None) -> tuple:
-    """TRAY ID 기준으로 트레이별 상대판정 실행"""
-
+            labels: pd.Series = None,
+            t_min: float = None,
+            t_max: float = None) -> tuple:
+    """
+    TRAY ID 기준 트레이별 상대판정.
+    t_min / t_max 설정 시 해당 온도 범위 밖 셀은 분석 제외(-1).
+    """
     tray_col = m.get("tray_id")
+
+    # ── 온도 필터 마스크 ────────────────────────────────────
+    temp_mask = pd.Series(True, index=feat.index)
+    if "T_avg" in feat.columns and (t_min is not None or t_max is not None):
+        T_avg = feat["T_avg"]
+        if t_min is not None:
+            temp_mask &= (T_avg >= t_min)
+        if t_max is not None:
+            temp_mask &= (T_avg <= t_max)
+        n_excl = (~temp_mask).sum()
+        lo  = str(t_min) if t_min is not None else "제한없음"
+        hi  = str(t_max) if t_max is not None else "제한없음"
+        rng = f"{lo} ~ {hi}"
+        print(f"\n  [온도 필터] {rng} °C  →  분석 대상 {temp_mask.sum()}셀 / 제외 {n_excl}셀")
 
     print("\n" + "="*60)
     if tray_col and tray_col in feat.columns:
@@ -406,46 +440,72 @@ def run_all(feat: pd.DataFrame, m: dict,
         print(" 전체 데이터 일괄 판정 (TRAY ID 없음)")
     print("="*60)
 
+    # 결과 초기화: -1 = 분석 제외
+    METHOD_COLS = ["Baseline", "C_DPAT", "A_TempReg",
+                   "D_Kslope", "D_Kslope_strict",
+                   "B_NNR", "AB_Combined", "E_ML"]
+    res   = pd.DataFrame(-1, index=feat.index, columns=METHOD_COLS)
+    extra = {}
+
+    def _run_group(group_feat, group_mask):
+        """온도 필터 적용 후 분석 대상만 추려서 실행"""
+        sub = group_feat[group_mask.reindex(group_feat.index, fill_value=False)]
+        if len(sub) == 0:
+            return pd.DataFrame(-1, index=group_feat.index, columns=METHOD_COLS), {}
+        sub_res, sub_extra = _run_one_tray(sub, m, k, floor)
+        # 제외 셀은 -1 유지
+        full_res = pd.DataFrame(-1, index=group_feat.index, columns=sub_res.columns)
+        full_res.update(sub_res)
+        return full_res, sub_extra
+
     if tray_col and tray_col in feat.columns:
         res_parts   = []
         extra_parts = {}
-
         for tray_id, group in feat.groupby(feat[tray_col], sort=False):
-            tray_res, tray_extra = _run_one_tray(group, m, k, floor)
+            tray_res, tray_extra = _run_group(group, temp_mask)
             res_parts.append(tray_res)
             for key, val in tray_extra.items():
                 extra_parts.setdefault(key, []).append(val)
-
         res   = pd.concat(res_parts).reindex(feat.index)
         extra = {key: pd.concat(vals).reindex(feat.index)
                  for key, vals in extra_parts.items()}
     else:
-        res, extra = _run_one_tray(feat, m, k, floor)
+        res, extra = _run_group(feat, temp_mask)
 
-    # ── 요약 출력 ────────────────────────────────────────────
-    print(f"\n  {'방법':<25} {'불량수':>6} {'불량율':>7}")
-    print("  " + "-"*40)
+    # ── 요약 출력 (제외 셀 제외하고 집계) ────────────────────
+    n_analyzed = int(temp_mask.sum())
+    print(f"\n  {'방법':<25} {'불량수':>6} {'불량율(분석대상)':>16}")
+    print("  " + "-"*50)
     for col in res.columns:
-        n   = int(res[col].sum())
-        pct = n / len(res) * 100
-        print(f"  {col:<25} {n:>6}  {pct:>6.2f}%")
+        analyzed = res[col][res[col] >= 0]   # -1 제외
+        n   = int((analyzed == 1).sum())
+        pct = n / max(n_analyzed, 1) * 100
+        print(f"  {col:<25} {n:>6}  {pct:>15.2f}%")
 
     if labels is not None:
-        _eval_all(res, labels)
+        _eval_all(res, labels, temp_mask)
 
     return res, extra
 
 
-def _eval_all(res: pd.DataFrame, labels: pd.Series):
+def _eval_all(res: pd.DataFrame, labels: pd.Series,
+              temp_mask: pd.Series = None):
+    """감도/특이도 계산. 분석 제외(-1) 셀은 무시."""
     y = labels.astype(int).values
     print(f"\n  {'방법':<25} {'감도':>7} {'특이도':>7} {'미검':>5} {'과검':>5}")
     print("  " + "-"*52)
     for col in res.columns:
-        yp = res[col].astype(int).values
-        tp = int(((yp == 1) & (y == 1)).sum())
-        fp = int(((yp == 1) & (y == 0)).sum())
-        fn = int(((yp == 0) & (y == 1)).sum())
-        tn = int(((yp == 0) & (y == 0)).sum())
+        yp_raw = res[col].values
+        # -1(제외) 셀은 평가에서 빼기
+        valid  = yp_raw >= 0
+        if temp_mask is not None:
+            valid &= temp_mask.values
+        yp = yp_raw[valid]
+        yt = y[valid]
+        tp = int(((yp == 1) & (yt == 1)).sum())
+        fp = int(((yp == 1) & (yt == 0)).sum())
+        fn = int(((yp == 0) & (yt == 1)).sum())
+        tn = int(((yp == 0) & (yt == 0)).sum())
         sens = tp / (tp + fn + 1e-9)
         spec = tn / (tn + fp + 1e-9)
         print(f"  {col:<25} {sens:>6.3f}  {spec:>6.3f}  {fn:>4}  {fp:>4}")
@@ -465,7 +525,7 @@ def plot_dashboard(feat: pd.DataFrame, res: pd.DataFrame,
     plt.rcParams["axes.unicode_minus"] = False
 
     fig = plt.figure(figsize=(22, 16))
-    fig.suptitle("dOCV 선별 로직 고도화 – 방법 비교 대시보드",
+    fig.suptitle("dOCV 선별 로직 고도화 - 방법 비교 대시보드",
                  fontsize=15, fontweight="bold")
     gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
 
@@ -666,10 +726,12 @@ class MappingDialog:
             row=sep, column=0, columnspan=2, sticky="ew", pady=8)
 
         params = [
-            ("k (MAD 배수, 기본 3.5)",  "k",     str(K_SIGMA)),
-            ("바닥값 floor (mV)",        "floor", str(FLOOR_MV)),
-            ("dt1 (OCV1→2 간격, 일)",    "dt1",   str(DT1_DAY)),
-            ("dt2 (OCV2→3 간격, 일)",    "dt2",   str(DT2_DAY)),
+            ("k (MAD 배수, 기본 3.5)",       "k",     str(K_SIGMA)),
+            ("바닥값 floor (mV)",             "floor", str(FLOOR_MV)),
+            ("dt1 (OCV1→2 간격, 일)",         "dt1",   str(DT1_DAY)),
+            ("dt2 (OCV2→3 간격, 일)",         "dt2",   str(DT2_DAY)),
+            ("온도 필터 최솟값 °C (빈칸=없음)", "t_min", ""),
+            ("온도 필터 최댓값 °C (빈칸=없음)", "t_max", ""),
         ]
         self._pvars = {}
         for i, (lbl, key, default) in enumerate(params):
@@ -699,12 +761,20 @@ class MappingDialog:
             try:   return float(self._pvars[key].get())
             except: return default
 
+        def _fopt(key):
+            """빈 문자열이면 None 반환"""
+            v = self._pvars[key].get().strip()
+            try:   return float(v) if v else None
+            except: return None
+
         self.result = {
             "mapping": mapping,
-            "k":    _f("k",    K_SIGMA),
-            "floor":_f("floor",FLOOR_MV),
-            "dt1":  _f("dt1",  DT1_DAY),
-            "dt2":  _f("dt2",  DT2_DAY),
+            "k":     _f("k",    K_SIGMA),
+            "floor": _f("floor",FLOOR_MV),
+            "dt1":   _f("dt1",  DT1_DAY),
+            "dt2":   _f("dt2",  DT2_DAY),
+            "t_min": _fopt("t_min"),
+            "t_max": _fopt("t_max"),
         }
         self._top.destroy()
 
@@ -762,7 +832,8 @@ def run_gui():
                 labels = parse_label(df[m["label"]])
 
             res, extra = run_all(feat, m, k=cfg["k"],
-                                 floor=cfg["floor"], labels=labels)
+                                 floor=cfg["floor"], labels=labels,
+                                 t_min=cfg["t_min"], t_max=cfg["t_max"])
 
             save_dir = os.path.dirname(sel[0])
             base     = os.path.splitext(os.path.basename(sel[0]))[0]
